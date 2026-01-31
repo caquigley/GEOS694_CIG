@@ -1,0 +1,12 @@
+alias geos694='conda activate geos694'
+alias uafinfra='conda activate uafinfra'
+alias pygmt='conda activate pygmt'
+alias research='cd /Users/cadequigley/Downloads/Research'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ....='cd ../../..'
+alias .....='cd ../../../..'
+alias deactivate='conda deactivate'
+alias ls='ls -G'
+
+
