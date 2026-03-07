@@ -9,11 +9,426 @@ from obspy import Trace
 from obspy import UTCDateTime
 from datetime import datetime, time, timezone
 import datetime as dt
+from scipy.optimize import least_squares
 from obspy.taup import TauPyModel
 from obspy.taup import taup_create
+from obspy.core.util import AttribDict
+from obspy.signal.array_analysis import array_processing
 from obspy.geodetics import gps2dist_azimuth
 from obspy.geodetics import kilometers2degrees
 from obspy.signal.util import util_geo_km
+from obspy.signal.trigger import recursive_sta_lta, trigger_onset, classic_sta_lta
+import glob
+import itertools
+#from pyproj import Geod
+
+import lts_array
+import pandas as pd
+import numpy as np
+from obspy import Stream
+from obspy.core import UTCDateTime
+from obspy.core import UTCDateTime
+from obspy.clients.fdsn.header import FDSNNoDataException
+
+import matplotlib.dates as mdates
+
+
+def triggers(st, moveout, min_triggers, ptolerance,
+             START, window_start, WINDOW_LENGTH, multiple_triggers):
+    '''
+    Combines the different trigger functions (trigger_lists, 
+    triggers_associator) into a single function.
+    
+    Parameters:
+        st: obspy stream containing traces
+        moveout: expected moveout time across the array (seconds) (float)
+        min_triggers: minimum picks to associate into a trigger (int)
+        ptolerance: seconds around p-pick to allow association (float)
+        START: start time of stream (UTCDateTime)
+        window_start: where in time (seconds) to start analysis relative to p-pick (float)
+        WINDOW_LENGTH: window length of array analysis window (seconds)
+        multiple_triggers: how to handle multiple triggers ('peak' or 'closest')
+
+    Returns: 
+        st: stream that is trimmed based on trigger time and other parameters
+        trigger: trigger time relative to start time (seconds)
+        peak: STA/LTA ratio of nearest peak to trigger
+        length: length of STA/LTA trigger duration
+        trigger_type: 
+            'STA/LTA': single STA/LTA trigger
+            'Multiple triggers': multiple triggers, chosen based on multiple triggers input
+            'Taup': no STA/LTA trigger, using Taup time and larger window to search
+        trigger_time: trigger time (str)
+        START_new: start time of new stream
+        END_new: end time of new stream
+    '''
+
+    trigger_lists = []
+    trigger_peaks = []
+    trigger_lengths = []
+    for s in range(len(st)):
+        times, peaks, lengths = trigger_list(st[s])
+        trigger_lists.append(times)
+        trigger_peaks.append(peaks)
+        trigger_lengths.append(lengths)
+
+
+    # Associate triggers together based on expected moveout------------
+            
+
+    times, peaks, lengths = triggers_associator(trigger_lists, 
+                                                trigger_peaks, 
+                                                trigger_lengths, 
+                                                moveout, min_triggers)
+            
+    times = np.array(times)
+    peaks = np.array(peaks)
+    lengths = np.array(lengths)
+    # Create mask to find triggers around expected p-arrival---------
+    mask = np.abs(times - 60) <= ptolerance
+    trigger_filtered = times[mask]
+    peaks_filtered = peaks[mask]
+    lengths_filtered = lengths[mask]
+            
+    if len(trigger_filtered) == 0: #no triggers around p-pick
+        trigger = 60 
+        trigger_type = 'Taup'
+        peak = 0
+        length = 0
+        #Trim stream to allow for search for cross correlation
+        START_new = START + trigger + window_start- 0.001 - ptolerance
+        END_new = START_new + 2*ptolerance
+        st = st.slice(START_new, END_new)
+    elif len(trigger_filtered) >1: #multiple triggers around p-pick
+        
+        trigger_type = 'Multiple triggers'
+
+        if multiple_triggers == 'peak':
+            ####CHOOSING TRIGGER WITH LARGER PEAK-
+            idx = np.argmax(peaks_filtered)
+            trigger = trigger_filtered[idx]
+            peak = peaks_filtered[idx]
+            length = lengths_filtered[idx]
+        else: 
+            ###CHOOSING TRIGGER CLOSEST TO EXPECTED ARRIVAL
+            idx = np.argmin(np.abs(trigger_filtered - 60))
+            trigger = trigger_filtered[idx]
+            peak = peaks_filtered[idx]
+            length = lengths_filtered[idx]
+                
+                
+        #Trim stream to window of interest-------------
+        START_new = START + trigger + window_start- 0.001
+        END_new = START_new + WINDOW_LENGTH
+        st = st.slice(START_new, END_new)
+
+    else:
+        trigger = trigger_filtered[0]
+        peak = peaks_filtered[0]
+        length = lengths_filtered[0]
+        trigger_type = 'STA/LTA trigger'
+        #Trim stream to window of interest-------------
+        START_new = START + trigger + window_start- 0.001
+        END_new = START_new + WINDOW_LENGTH
+        st = st.slice(START_new, END_new)
+
+    print(trigger_type)
+
+    trigger_time = str(START+trigger)
+
+    return st, trigger, peak, length, trigger_type, trigger_time, START_new, END_new
+
+
+def least_trimmed_squares(processing, st, sta_lats, sta_lons, WINDOW_LENGTH,
+                  WINDOW_OVERLAP,trigger_time, trigger_type, peak,
+                  length, origin_lat, origin_lon, 
+                  event_id, eq_baz_real, eq_slow_real):
+    
+    '''
+    Calculates least trimmed squares and organizes data
+    
+    Parameters:
+        processing: 'lts', 'ls'
+        st: obspy stream containing traces
+        sta_lats: station lats (list or array)
+        sta_lons: station lons (list or array)
+        WINDOW_LENGTH: window length of array analysis window (seconds)
+        WINDOW_OVERLAP: overlap between analysis windows
+        trigger_time: trigger time in UTC (string)
+        trigger_type: 
+            'STA/LTA': single STA/LTA trigger
+            'Multiple triggers': multiple triggers, chosen based on multiple triggers input
+            'Taup': no STA/LTA trigger, using Taup time and larger window to search 
+        peak: STA/LTA ratio of nearest peak to trigger
+        length: length of STA/LTA trigger duration
+        origin_lat: latitude of array center
+        origin_lon: longitude of array center
+        event_id: USGS earthquake identifier
+        eq_baz_real: backazimuth between catalog event and array
+        eq_slow_real: calculated slowness based on velocity model
+
+    Returns: 
+        pandas dataframe: 
+        'array_baz': array backazimuth
+        'array_slow': array slowness
+        'array_vel': array trace velocity
+        'mdccm': array mdccm (cross correlation power)
+        'conf_int_vel': confidence interval of trace velocity
+        'conf_int_baz': confidene interval of backazimuth
+        'time': time of array analysis (UTC)
+        'event_id': USGS event ID
+        'baz_error': backazimuth error (real - array)
+        'slow_error': slowness error (real - array)
+        'trigger_time': trigger time
+        'trigger_type': trigger type
+        'sta/lta': peak of nearest peak from sta/lta for trigger
+        'trigger_length': length of trigger in seconds
+        'num_stations': number of stations used
+        'array_lat': array center latitude
+        'array_lon': array center longitude
+    '''
+    
+
+    if processing == 'lts':
+        ALPHA = 0.5 #least trimmed squares
+        print('Starting LTS')
+    else:
+        ALPHA = 1 #least squares
+        print('Starting LS')
+            
+    (lts_vel, lts_baz, t, mdccm, stdict, sigma_tau,
+        conf_int_vel, conf_int_baz) = lts_array.ltsva(st, sta_lats, 
+                                                    sta_lons, 
+                                                    WINDOW_LENGTH, 
+                                                    WINDOW_OVERLAP, 
+                                                    ALPHA)
+
+    if len(lts_baz) >1: #pulling out max cross correlation
+        print('Pulling out max mdccm')
+        idx = np.argmax(mdccm)
+    else: #should only be one value for trigger time
+        idx = 0
+    data = {
+        'array_baz': lts_baz[idx],
+        'array_slow': 1/lts_vel[idx],
+        'array_vel': lts_vel[idx],
+        'mdccm': mdccm[idx],
+        'conf_int_vel': conf_int_vel[idx],
+        'conf_int_baz': conf_int_baz[idx],
+        'time': str(UTCDateTime(mdates.num2date(t[idx]))),
+        'event_id': event_id,
+        'baz_error': baz_error(eq_baz_real, lts_baz[idx]),
+        'slow_error': eq_slow_real - (1/lts_vel[idx]),
+        'trigger_time': str(trigger_time),
+        'trigger_type': trigger_type,
+        'sta/lta': peak,
+        'trigger_length': length, 
+        'num_stations': len(st),
+        'array_lat': origin_lat,
+        'array_lon': origin_lon
+        }
+    array_data = pd.DataFrame(data, index=[0]) #print(array_data)
+    return array_data
+
+def fk_obspy(st1, stations, sta_lats, sta_lons, sta_elev, START, START_new, END_new,
+             WINDOW_LENGTH, WINDOW_OVERLAP, FREQ_MIN, FREQ_MAX,
+             sll_x, slm_x, sll_y, slm_y, sl_s, semb_thres, vel_thres, timestamp, prewhiten,
+            eq_baz, eq_slow, event_id, trigger, trigger_type, peak, length, origin_lat, origin_lon):
+    print('Starting FK')
+    #Add necessary data to streams----------------
+    for l in range(len(stations)):  # Uses all stations in pd dataframe stations
+        st1[l].stats.coordinates = AttribDict({
+            'latitude': sta_lats[l],
+            'elevation': sta_elev[l],
+            'longitude': sta_lons[l]})
+
+    #Set up dictionary based on input parameters----------------------------
+    kwargs = dict(
+            # slowness grid: X min, X max, Y min, Y max, Slow Step
+            sll_x=sll_x, slm_x=slm_x, sll_y=sll_y, slm_y=slm_y, sl_s=sl_s,
+            # sliding window properties
+            win_len=WINDOW_LENGTH, win_frac=WINDOW_OVERLAP,
+            # frequency properties
+            frqlow=FREQ_MIN, frqhigh=FREQ_MAX, prewhiten=prewhiten,
+            # restrict output
+            semb_thres=semb_thres, vel_thres=vel_thres, timestamp=timestamp,
+            #stime=START+1, etime=END-1 #had to add and subtract 2 to avoid timing errors
+            stime=START_new, etime = END_new
+                )
+    out = array_processing(st1, **kwargs)
+    
+    #OUTPUT FROM FK PROCESSING-----------------------------------------------------
+    array_out = pd.DataFrame(out, columns = ['time','relpow','abspow','baz_obspy','array_slow'])
+        
+
+    #Convert times and baz to same scale as lts (UTC time, centered on window)------------
+    t = array_out['time'].to_numpy()
+    baz_obspy = array_out['baz_obspy'].to_numpy()
+        
+    bazs = []
+    time_error = []
+    for j in range(len(t)):
+        matplotlib_time = t[j]
+        x = mdates.num2date(matplotlib_time) 
+        x = UTCDateTime(x)
+        #diff = (x-UTCDateTime(time_station))+(win_len/2)
+        diff = str(x+(WINDOW_LENGTH/2)) #time centered on point
+        time_error.append(diff)
+        baz = baz_obspy[j]
+        if baz <= 0:
+            baz_correct = baz+360 #converts to all positive backazimuth
+        else:
+            baz_correct = baz
+        bazs.append(baz_correct)
+        
+    time_error = np.array(time_error)
+    fk_bazs = np.array(bazs)
+
+    #Calculate baz/slow error---------------------------------------
+    fk_baz_error = baz_error(eq_baz, fk_bazs)
+
+    trace_vel_error = (1/eq_slow)- 1/array_out['array_slow'].to_numpy() #real - array
+
+    slowness_error = (eq_slow) - array_out['array_slow'].to_numpy()
+
+    #Start to aggregate data----------------------------
+    array_out['baz_error'] = fk_baz_error
+    #array_out['centered_time'] = time_error
+    array_out['time'] = time_error
+    array_out['array_baz'] = fk_bazs
+    array_out['slow_error'] = slowness_error
+    array_out['array_vel'] = 1/array_out['array_slow'].to_numpy()
+
+    #Pull out greatest power (should be only one value if using triggers)------------
+    idx = np.argmax(array_out['relpow'].to_numpy())
+
+    #Save data--------------------------------------
+    array_data = array_out.loc[[idx]]
+    array_data['event_id'] = event_id
+    array_data['trigger_type'] = trigger_type
+    array_data['trigger_time'] = str(START+trigger)
+    array_data['sta/lta'] = peak
+    array_data['trigger_length'] = length
+    array_data['num_stations'] = len(st1)
+    array_data['array_lat'] = origin_lat
+    array_data['array_lon'] = origin_lon
+    array_data['conf_int_vel'] = 0 #values not returned for FK, keeping for consistency with other codes
+    array_data['conf_int_baz'] = 0 #values not returned for FK, keeping for consistency with other codes
+    array_data['mdccm'] = 0 #values not returned for FK, keeping for consistency with other codes
+
+    return array_data
+
+
+def grab_preprocess(stations, station_info, inv, 
+                    net, loc, chan, min_stations, 
+                    START, END, FREQ_MIN, FREQ_MAX, client):
+    
+    station_sub = station_info[station_info['station'].isin(stations)] #pull out specific station info
+    
+    sta_lats = station_sub['lat'].to_numpy()
+    sta_lons = station_sub['lon'].to_numpy()
+    stations = station_sub['station'].to_numpy()
+    sta_elev = station_sub['elevation'].to_numpy()
+    st = Stream()
+    failed_stations = []
+
+    for sta in stations:
+        try:
+            st += client.get_waveforms(net, sta, loc, chan, START, END)
+        except FDSNNoDataException:
+            print(f"No data for station {sta}")
+            failed_stations.append(sta)
+        except Exception as e:
+            print(f"Error for station {sta}: {e}")
+            failed_stations.append(sta)
+
+    # Remove stations that did not have data from metadata
+    if failed_stations:
+        mask = ~np.isin(stations, failed_stations)
+        stations = stations[mask]
+        sta_lats = sta_lats[mask]
+        sta_lons = sta_lons[mask]
+        sta_elev = sta_elev[mask]
+        
+    # Check to see if there are enough stations----
+    if len(st) < min_stations:
+        raise ValueError("Not enough traces")
+
+    # Basic data preperation-----------    
+    st.merge(fill_value='latest')
+    st.trim(START, END, pad='true', fill_value=0)
+    st.sort()
+    st.remove_sensitivity(inventory = inv)
+
+        # Filter the data
+    st.filter("bandpass", freqmin=FREQ_MIN, freqmax=FREQ_MAX, 
+                corners=2, zerophase=True)
+        
+    st.taper(max_percentage=0.05)
+    
+    return st, stations, sta_lats, sta_lons, sta_elev
+
+
+def moveout_time(output):
+    '''
+    Calculates the minimum moveout time across the array based on maximum
+    interstation distacne and velocity, including some wiggle room
+    
+    Parameters:
+        output: output from get_geometry function. Contains interstation distances
+
+    Returns: 
+        moveout: expected moveout time in seconds (float)
+        
+        
+    '''
+    #### Calculate interstation distances/moveout time
+    xpos = list(output[:,0])
+    xpos = xpos[:-1]
+    ypos = list(output[:,1])
+    ypos = ypos[:-1]
+    distances_temp = interstation_distances(xpos, ypos)
+    moveout = (np.max(distances_temp)/3)+0.5 #t = d/v + error
+    return moveout
+
+def array_time_window(use_full_deployment, start_d1_list, end_d1_list,
+                      starttime, endtime):
+    '''
+    Defines what dates to look for earthquakes based on active stations
+    
+    Parameters:
+        use_full_deployment: whether to use full time window deployment was out (True or False)
+        start_d1_list: list of start times for each station
+        end_d1_list: list of end times for each station
+        starttime: specified starttime, will use if use_full_deployment = True
+        endtime: speficied endtime, will use if use_full_deployment = True
+
+    Returns: 
+        start: start time to look for earthquakes
+        end: end time to look for earthquakes
+        
+        
+    '''
+    if use_full_deployment ==True:
+        start = str(np.min(start_d1_list)) #time when first station online
+        if str(type(end_d1_list[0])) == "<class 'NoneType'>": #deals with case where station/array is still active by taking time today
+            end_temp = UTCDateTime.now()
+            end = str(end_temp)
+            temp = []
+            for i in range(len(end_d1_list)):
+                temp.append(end_temp)
+            end_d1_list = temp
+        else:
+            end = str(np.max(end_d1_list)) #time when last station offline
+
+    else: #use restricted time window specified at start
+        start = starttime
+        end = endtime
+    
+    return start, end
+
+    
+
 
 
 ############################################################
@@ -65,13 +480,30 @@ def calculate_slowness(distance_km, depth, velocity_model):
 
     return slowness, trace_vel, incident_angle, p_arrival
 
-def data_from_inventory(inv):
+def misbehaving_stations_lts(d, threshold=4):
+    """
+    Returns a list of values that appear more than `threshold` times
+    in the first array-like value found in the dictionary `d`.
+    Ignores non-array entries like 'size'.
+    """
+    # Find the first array in the dictionary
+    for key, val in d.items():
+        if isinstance(val, (np.ndarray, list)):  # supports arrays or lists
+            arr = np.array(val)  # convert to numpy array if list
+            unique, counts = np.unique(arr, return_counts=True)
+            return unique[counts > threshold].tolist()
+    # Return empty if no array found
+    return []
+
+def data_from_inventory(inv, remove_stations, keep_stations):
 
     """
     Pulls pertinent information out of an inventory for arrays.
     
     Parameters:
         inv: station inventory based on station.xml format from FDSN
+        remove_stations: list of station names to remove if there is a known
+                          issue with the station. Example: ['2A12', '2A14']
         
     Returns:
         lat_list: list of station latitudes
@@ -98,10 +530,58 @@ def data_from_inventory(inv):
             station_list.append(station.code)
             elev_list.append(station.elevation)
             start_list.append(station.start_date)
-            end_list.append(station.end_date)
+            if station.end_date == None:
+                end_list.append(UTCDateTime.now())
+            else:
+                end_list.append(station.end_date)
             num_channels_list.append(station.total_number_of_channels)
+            
+    if len(remove_stations) > 0: 
+        for k in range(len(remove_stations)):
+            station = remove_stations[k]
+            idx = station_list.index(station)
+            del lat_list[idx]
+            del lon_list[idx]
+            del station_list[idx]
+            del elev_list[idx]
+            del start_list[idx]
+            del end_list[idx]
+            del num_channels_list[idx]
+
+    if len(keep_stations) > 0:
+
+        mask = [sta in keep_stations for sta in station_list]
+
+        lat_list = [lat_list[i] for i in range(len(mask)) if mask[i]]
+        lon_list = [lon_list[i] for i in range(len(mask)) if mask[i]]
+        station_list = [station_list[i] for i in range(len(mask)) if mask[i]]
+        elev_list = [elev_list[i] for i in range(len(mask)) if mask[i]]
+        start_list = [start_list[i] for i in range(len(mask)) if mask[i]]
+        end_list = [end_list[i] for i in range(len(mask)) if mask[i]]
+        num_channels_list = [num_channels_list[i] for i in range(len(mask)) if mask[i]]
+
+        
 
     return lat_list, lon_list, elev_list, station_list, start_list, end_list, num_channels_list
+
+
+def check_num_stations(min_stations, station_list):
+    '''
+    Checks if the minimum number of stations is met.
+    
+    Parameters:
+        min_stations: minimum stations wanted
+        station_list: list of stations
+
+    Returns: 
+        ValueError if not enough stations
+        
+        
+    '''
+    num_stations = len(station_list)
+    if num_stations < min_stations:
+        raise ValueError("The minimum stations is greater then the number of available stations.")
+
 
 def get_geometry(lat_list, lon_list, elev_list, return_center = False):
 
@@ -144,7 +624,27 @@ def get_geometry(lat_list, lon_list, elev_list, return_center = False):
     else:
         return geometry
 
+def interstation_distances(xpos, ypos):
+    points = np.column_stack((xpos, ypos))  # shape (N, 2)
+
+    dx = points[:, 0][:, None] - points[:, 0][None, :]
+    dy = points[:, 1][:, None] - points[:, 1][None, :]
+
+    distances = np.sqrt(dx**2 + dy**2)
+    return distances
+
 def utc2datetime(utctime): #utc time as string
+    '''
+    Converts string of utctime to datetime
+    
+    Parameters:
+        utctime: time in utc (string)
+
+    Returns: 
+        datetime object
+        
+        
+    '''
     return dt.datetime(int(utctime[0:4]),int(utctime[5:7]), int(utctime[8:10]), int(utctime[11:13]),int(utctime[14:16]),int(utctime[17:19]))
     
 def is_between(check, start, end): #Returns true/false based on whether time is between two values
@@ -238,11 +738,17 @@ def pull_earthquakes(lat, lon, max_rad, start, end, min_mag, array_name, velocit
         name= name[8:]
 
         #Calculate distance, backazimuth
-        dist, baz, az = gps2dist_azimuth(latitude, longitude, float(lat), float(lon))
+        dist, baz, az = gps2dist_azimuth(float(lat), float(lon), latitude, longitude)
         dist = dist/1000 #converts m to km
-        
-        #Calculate slowness, trace velocity, incident angle, and arrival time
-        slow, t_vel, incident, p = calculate_slowness(dist, depth, velocity_model)
+
+        if depth < 0:
+            slow = 0
+            t_vel = 0
+            incident = 0
+            p = 0
+        else:
+            #Calculate slowness, trace velocity, incident angle, and arrival time
+            slow, t_vel, incident, p = calculate_slowness(dist, depth, velocity_model)
         
         # Append data to lists
         depths.append(depth)
@@ -281,10 +787,689 @@ def pull_earthquakes(lat, lon, max_rad, start, end, min_mag, array_name, velocit
     df = pd.DataFrame(data)
     return df
 
+def stations_available_generator(earthquake_time_list, station_d1_list, start_d1_list, end_d1_list):
+    '''
+    Finds which stations are available for each earthquake.
+    
+    Parameters:
+        earthquake_time_list: list of earhtquake times (UTC)
+        station_d1_list: list of all stations
+        start_d1_list: list of start times for each station
+        end_d1_list: list of end times for each station
+        
+
+    Returns: 
+        station_lists: list of different stations available for each event
+        stations_available: number of stations available for each earthquake
+        
+        
+    '''
+    stations_lists = []
+    stations_available = []
+    for i in range(len(earthquake_time_list)): #setting up earthquakes to loop through
+        eq_time = earthquake_time_list[i]
+        eq_time = utc2datetime(str(eq_time))
+        station_temp = []
+
+        ### Check deployment for station availability----------------------------
+        for k in range(len(station_d1_list)):
+            start_mseed = start_d1_list[k]
+            start_mseed = utc2datetime(str(start_mseed))
+            end_mseed = end_d1_list[k]
+            end_mseed = utc2datetime(str(end_mseed))
+        
+            #Find if station exists------------------------    
+            x = is_between(eq_time, start_mseed, end_mseed)
+
+            if x == True:
+                station_temp.append(station_d1_list[k])
+            
+        stations_lists.append(station_temp)
+    
+        stations_available.append(len(station_temp))
+        
+    return stations_lists, stations_available
+'''
+def stations_available_generator_hm_kd(earthquake_time, station_d1_list, start_d1_list,
+                                         end_d1_list, station_d2_list, start_d2_list, end_d2_list, array_name):
+    #earthquake_time = df['time_utc'].to_numpy()
+    #earthquake_names = df['event_id'].to_numpy()
+    
+    stations_lists = []
+    stations_available = []
+    deployment = []
+    for i in range(len(earthquake_time)): #setting up earthquakes to loop through
+        eq_time = earthquake_time[i]
+        eq_time = utc2datetime(str(eq_time))
+        station_temp = []
+    
+        ### Check first deployment for station availability----------------------------
+        for k in range(len(station_d1_list)):
+            start_mseed = start_d1_list[k]
+            start_mseed = utc2datetime(str(start_mseed))
+            if array_name =='HM': #look at bear removal dates------------
+                ## PULL IN BEAR DATA------------------
+                array = 'homer'
+                bears = pd.read_csv('/Users/cadequigley/Downloads/Research/deployment_array_design/'+array+'_mseed_completeness.csv') #contains start/end times
+                bears = bears[["station_name", "bear_removal_time_d1","bear_removal_time_d2"]]
+                bear_time_d1 = bears['bear_removal_time_d1'].to_list()
+                bear_time_d2 = bears['bear_removal_time_d2'].to_list()
+                del bear_time_d2[5] #Removes HM06 since it doesn't have data in station xml for second deployment
+
+                if bear_time_d1[k] == '0':
+                    end_mseed = end_d1_list[k]
+                    end_mseed = utc2datetime(str(end_mseed))
+                else:
+                    end_mseed = bear_time_d1[k]
+                    end_mseed = utc2datetime(str(end_mseed))
+    
+            else: #kodiak array, doesn't have any nodes removed by bears
+                end_mseed = end_d1_list[k]
+                end_mseed = utc2datetime(str(end_mseed))
+            
+            #Find if station exists------------------------    
+            x = is_between(eq_time, start_mseed, end_mseed)
+    
+            if x == True:
+                station_temp.append(station_d1_list[k])
+                deployment.append('d1')
+                
+        ### Check second deployment for station availability----------------------------
+        # in a different for loop in case there are different lengths
+        for t in range(len(station_d2_list)):
+            start_mseed = start_d2_list[t]
+            start_mseed = utc2datetime(str(start_mseed))
+            if array_name =='HM':
+                if bear_time_d2[t] == '0':
+                    end_mseed = end_d2_list[t]
+                    end_mseed = utc2datetime(str(end_mseed))
+                else:
+                    end_mseed = bear_time_d2[t]
+                    end_mseed = utc2datetime(str(end_mseed))
+    
+            else:
+                end_mseed = end_d2_list[t]
+                end_mseed = utc2datetime(str(end_mseed))
+    
+            n = is_between(eq_time, start_mseed, end_mseed)
+    
+            if n == True:
+                station_temp.append(station_d2_list[t])
+                deployment.append('d2')
+    
+        stations_lists.append(station_temp)
+        #station_lists_handheld.append(station_temp_h)
+        stations_available.append(len(station_temp))
+
+    return stations_lists, stations_available, deployment
+
+'''    
+
+'''
+
+def stations_available_generator_hm_kd(
+    earthquake_time,
+    station_d1_list, start_d1_list, end_d1_list,
+    station_d2_list, start_d2_list, end_d2_list,
+    array_name
+):
+
+    # ----------------------------
+    # Pre-load bear data ONCE
+    # ----------------------------
+    bear_time_d1 = None
+    bear_time_d2 = None
+
+    if array_name == "HM":
+        array = "homer"
+        bears = pd.read_csv(
+            f"/Users/cadequigley/Downloads/Research/deployment_array_design/{array}_mseed_completeness.csv"
+        )[["station_name", "bear_removal_time_d1", "bear_removal_time_d2"]]
+
+        bear_time_d1 = bears["bear_removal_time_d1"].tolist()
+        print(bear_time_d1)
+        bear_time_d2 = bears["bear_removal_time_d2"].tolist()
+        print(bear_time_d2)
+    # ----------------------------
+    # Convert all times once
+    # ----------------------------
+    earthquake_time = [utc2datetime(str(t)) for t in earthquake_time]
+    start_d1_list = [utc2datetime(str(t)) for t in start_d1_list]
+    end_d1_list   = [utc2datetime(str(t)) for t in end_d1_list]
+    start_d2_list = [utc2datetime(str(t)) for t in start_d2_list]
+    end_d2_list   = [utc2datetime(str(t)) for t in end_d2_list]
+
+    stations_lists = []
+    stations_available = []
+    deployment_all = []
+
+    # ==========================================================
+    # Loop over earthquakes
+    # ==========================================================
+    for eq_time in earthquake_time:
+
+        station_temp = []
+        deployment_temp = []
+
+        # ----------------------------
+        # Deployment 1
+        # ----------------------------
+        for k, station in enumerate(station_d1_list):
+
+            start_time = start_d1_list[k]
+
+            if array_name == "HM" and bear_time_d1[k] != '0':
+                end_time = utc2datetime(str(bear_time_d1[k]))
+            else:
+                end_time = end_d1_list[k]
+
+            if is_between(eq_time, start_time, end_time):
+                station_temp.append(station)
+                deployment_temp.append("d1")
+
+        # ----------------------------
+        # Deployment 2
+        # ----------------------------
+        for t, station in enumerate(station_d2_list):
+
+            start_time = start_d2_list[t]
+
+            if array_name == "HM" and bear_time_d2[t] != '0':
+                end_time = utc2datetime(str(bear_time_d2[t]))
+            else:
+                end_time = end_d2_list[t]
+
+            if is_between(eq_time, start_time, end_time):
+                station_temp.append(station)
+                deployment_temp.append("d2")
+
+        stations_lists.append(station_temp)
+        stations_available.append(len(station_temp))
+        deployment_all.append(deployment_temp)
+
+    return stations_lists, stations_available, deployment_all
+'''
+import numpy as np
+import pandas as pd
+
+def stations_available_generator_hm_kd(
+    earthquake_time,
+    station_d1_list, start_d1_list, end_d1_list,
+    station_d2_list, start_d2_list, end_d2_list,
+    array_name
+):
+
+    # ---------------------------------
+    # Convert times once
+    # ---------------------------------
+    earthquake_time = np.array([utc2datetime(str(t)) for t in earthquake_time])
+
+    start_d1 = np.array([utc2datetime(str(t)) for t in start_d1_list])
+    end_d1   = np.array([utc2datetime(str(t)) for t in end_d1_list])
+
+    start_d2 = np.array([utc2datetime(str(t)) for t in start_d2_list])
+    end_d2   = np.array([utc2datetime(str(t)) for t in end_d2_list])
+
+    station_d1 = np.array(station_d1_list)
+    station_d2 = np.array(station_d2_list)
+
+    # ---------------------------------
+    # Load bear removal data
+    # ---------------------------------
+    if array_name == "HM":
+
+        bears = pd.read_csv(
+            "/Users/cadequigley/Downloads/Research/deployment_array_design/homer_mseed_completeness.csv"
+        )[["station_name","bear_removal_time_d1","bear_removal_time_d2"]]
+
+        bear_d1 = dict(zip(bears.station_name, bears.bear_removal_time_d1))
+        bear_d2 = dict(zip(bears.station_name, bears.bear_removal_time_d2))
+
+        # build arrays aligned with station lists
+        bear_d1_arr = np.array([bear_d1.get(sta, '0') for sta in station_d1])
+        bear_d2_arr = np.array([bear_d2.get(sta, '0') for sta in station_d2])
+
+        # apply bear removal overrides
+        mask = bear_d1_arr != '0'
+        end_d1[mask] = np.array([utc2datetime(str(t)) for t in bear_d1_arr[mask]])
+
+        mask = bear_d2_arr != '0'
+        end_d2[mask] = np.array([utc2datetime(str(t)) for t in bear_d2_arr[mask]])
+
+    # ---------------------------------
+    # Output containers
+    # ---------------------------------
+    stations_lists = []
+    stations_available = []
+    deployment_all = []
+
+    # ---------------------------------
+    # Loop earthquakes only
+    # ---------------------------------
+    for eq in earthquake_time:
+
+        mask_d1 = (eq >= start_d1) & (eq <= end_d1)
+        mask_d2 = (eq >= start_d2) & (eq <= end_d2)
+
+        sta_d1 = station_d1[mask_d1]
+        sta_d2 = station_d2[mask_d2]
+
+        stations = np.concatenate([sta_d1, sta_d2])
+        deployments = ["d1"]*len(sta_d1) + ["d2"]*len(sta_d2)
+
+        stations_lists.append(stations.tolist())
+        stations_available.append(len(stations))
+        deployment_all.append(deployments)
+
+    return stations_lists, stations_available, deployment_all
+
 def baz_error(baz_real, baz_calculated):
+    '''
+    Calculates backazimuth error between catalog baz and array baz
+    
+    Parameters:
+        baz_real: catalog backazimuth
+        baz_calculated: array calculated backazimuth
+
+    Returns: 
+        baz_error: catalog baz - array baz
+        
+        
+    '''
     baz_error_temp = baz_real - baz_calculated
     baz_error = ((baz_error_temp + 180) % 360) - 180
     return baz_error
+
+#def trigger_list(tr):
+    #sr = tr.stats.sampling_rate
+    #cft = classic_sta_lta(tr.data, int(2.5 * sr), int(30. * sr)) #classic sta/lta
+    #on_of = trigger_onset(cft, 2.5, 1.0) #1.7, 1.0
+
+    #if len(on_of) > 0: 
+        #triggers = on_of[:, 0]/sr #triggers in seconds from start
+            
+    #return list(triggers)
+
+#def trigger_list(tr):
+    #sr = tr.stats.sampling_rate
+    #cft = classic_sta_lta(tr.data, int(2.5 * sr), int(30. * sr))
+    #on_of = trigger_onset(cft, 2.5, 1.0)
+
+    #return list(on_of[:, 0] / sr) if len(on_of) > 0 else []
+
+def trigger_list(tr):
+    '''
+    Calculates triggers in a station trace using classic sta/lta
+    
+    Parameters:
+        trace: trace for a single station
+
+    Returns: 
+        trigger_times: list of triggers (seconds since start)
+        trigger_peaks: list of sta/lta peak values
+        trigger_lengths: list of length of trigger
+        
+        
+    '''
+    sr = tr.stats.sampling_rate
+    cft = classic_sta_lta(tr.data, int(2.5 * sr), int(30. * sr))
+    on_of = trigger_onset(cft, 2.5, 1.0)
+
+    trigger_times = []
+    trigger_peaks = []
+    trigger_lengths = []
+
+    for on, off in on_of:
+        # time of trigger (seconds from trace start)
+        trigger_time = on / sr
+        trigger_times.append(trigger_time)
+
+        # peak STA/LTA value in that window
+        peak_value = np.max(cft[on:off])
+        trigger_peaks.append(peak_value)
+
+        # window duration in seconds
+        window_length = (off - on) / sr
+        trigger_lengths.append(window_length)
+
+    return trigger_times, trigger_peaks, trigger_lengths
+
+'''
+def triggers_associator(trigger_lists, moveout, min_stations): ##This is the good one!!!
+
+    time_groups = []
+    for i in range(len(trigger_lists)): #loop over all trigger lists
+        triggers = trigger_lists[i]
+    #comparison = trigger_lists.pop(i)
+        comparison = trigger_lists[:i] + trigger_lists[i+1:]
+        for k in range(len(triggers)): #loop over target times in list
+            target_time = triggers[k]
+            group_times = []
+            group_times.append(target_time)
+            for l in range(len(comparison)): #compare to other lists
+                comp1 = comparison[l]
+                for t in range(len(comp1)): #compare to each value in each list
+                    test_time = comp1[t]
+                    if abs(target_time - test_time) < moveout:
+                        group_times.append(test_time)
+
+
+            group_times.sort()
+            if len(group_times) > min_stations:
+                time_groups.append(group_times)
+
+    unique_lists = list(map(list, set(map(tuple, time_groups))))
+
+    trigger_times = []
+    for i in range(len(unique_lists)):
+        if abs(np.max(unique_lists[i]) - np.min(unique_lists[i])) < moveout:
+            trigger_times.append(np.median(unique_lists[i])) #should this be np.min to match rest of study?
+
+    trigger_times.sort()
+    return trigger_times
+
+
+def triggers_associator_test(trigger_lists, peak_lists, moveout, min_stations):
+
+    time_groups = []
+    peak_groups = []
+
+    for i in range(len(trigger_lists)):
+        triggers = trigger_lists[i]
+        peaks = peak_lists[i]
+
+        comparison_times = trigger_lists[:i] + trigger_lists[i+1:]
+        comparison_peaks = peak_lists[:i] + peak_lists[i+1:]
+
+        for k in range(len(triggers)):
+            target_time = triggers[k]
+            target_peak = peaks[k]
+
+            group_times = [target_time]
+            group_peaks = [target_peak]
+
+            # Compare with other stations
+            for l in range(len(comparison_times)):
+                comp_times = comparison_times[l]
+                comp_peaks = comparison_peaks[l]
+
+                for t in range(len(comp_times)):
+                    test_time = comp_times[t]
+                    test_peak = comp_peaks[t]
+
+                    if abs(target_time - test_time) < moveout:
+                        group_times.append(test_time)
+                        group_peaks.append(test_peak)
+
+            group_times.sort()
+
+            if len(group_times) > min_stations:
+                time_groups.append(group_times)
+                peak_groups.append(group_peaks)
+
+    # Remove duplicates
+    unique = list(set(tuple(tg) for tg in time_groups))
+
+    trigger_times = []
+    trigger_peaks = []
+
+    for i, group in enumerate(unique):
+
+        group = list(group)
+
+        if abs(np.max(group) - np.min(group)) < moveout:
+
+            median_time = np.median(group)
+
+            # Find corresponding peak group
+            idx = time_groups.index(group)
+            group_peak_values = peak_groups[idx]
+
+            # Choose strength metric (recommended: sum of peaks)
+            cluster_peak = np.mean(group_peak_values) #sum or mean
+
+            trigger_times.append(median_time)
+            trigger_peaks.append(cluster_peak)
+
+    # Sort by time
+    sorted_idx = np.argsort(trigger_times)
+    trigger_times = np.array(trigger_times)[sorted_idx]
+    trigger_peaks = np.array(trigger_peaks)[sorted_idx]
+
+    return trigger_times, trigger_peaks
+
+def trigger_associator(st, estimated_p_arrival): ##This is the bad one!!!
+    
+    expected = estimated_p_arrival  # seconds
+    tolerance = 10.0     # seconds
+
+    trigger_list = []
+
+    for k in range(len(st)):
+        tr = st[k]
+        sr = tr.stats.sampling_rate
+        cft = classic_sta_lta(tr.data, int(2.5 * sr), int(30. * sr)) #classic sta/lta
+        on_of = trigger_onset(cft, 2.5, 1.0) #1.7, 1.0
+
+        if len(on_of) > 0: 
+            for i in range(len(on_of)):
+                triggers = on_of[:, 0]/sr #triggers in seconds from start
+                
+                #See if it's in the tolerance-----
+                mask = np.abs(triggers - expected) <= tolerance
+                trigger_filtered = triggers[mask]
+                if len(trigger_filtered) >0:
+                    trigger_list.append(trigger_filtered[0])
+            
+    
+
+    if len(trigger_list) > 5:
+        trigger = np.median(trigger_list) #need to add something about the expected moveout time....
+        trigger_type = 'trigger'
+    else:
+        trigger = expected
+        trigger_type = 'estimated'
+    return trigger, trigger_type
+    
+'''
+def triggers_associator(trigger_lists, peak_lists, length_lists,
+                        moveout, min_stations):
+
+    time_groups = []
+    peak_groups = []
+    length_groups = []
+
+    for i in range(len(trigger_lists)):
+        triggers = trigger_lists[i]
+        peaks = peak_lists[i]
+        lengths = length_lists[i]
+
+        comparison_times = trigger_lists[:i] + trigger_lists[i+1:]
+        comparison_peaks = peak_lists[:i] + peak_lists[i+1:]
+        comparison_lengths = length_lists[:i] + length_lists[i+1:]
+
+        for k in range(len(triggers)):
+
+            target_time = triggers[k]
+            target_peak = peaks[k]
+            target_length = lengths[k]
+
+            group_times = [target_time]
+            group_peaks = [target_peak]
+            group_lengths = [target_length]
+
+            for l in range(len(comparison_times)):
+                comp_times = comparison_times[l]
+                comp_peaks = comparison_peaks[l]
+                comp_lengths = comparison_lengths[l]
+
+                for t in range(len(comp_times)):
+                    test_time = comp_times[t]
+
+                    if abs(target_time - test_time) < moveout:
+                        group_times.append(test_time)
+                        group_peaks.append(comp_peaks[t])
+                        group_lengths.append(comp_lengths[t])
+
+            group_times.sort()
+
+            if len(group_times) > min_stations:
+                time_groups.append(group_times)
+                peak_groups.append(group_peaks)
+                length_groups.append(group_lengths)
+
+    # Remove duplicates
+    unique = list(set(tuple(tg) for tg in time_groups))
+
+    trigger_times = []
+    trigger_peaks = []
+    trigger_lengths = []
+
+    for group in unique:
+
+        group = list(group)
+
+        if abs(np.max(group) - np.min(group)) < moveout:
+
+            idx = time_groups.index(group)
+
+            median_time = np.median(group)
+
+            # strength metric
+            cluster_peak = np.sum(peak_groups[idx])
+
+            # length metric (choose what you prefer)
+            cluster_length = np.mean(length_groups[idx])  # recommended
+
+            trigger_times.append(median_time)
+            trigger_peaks.append(cluster_peak)
+            trigger_lengths.append(cluster_length)
+
+    sorted_idx = np.argsort(trigger_times)
+
+    return (
+        np.array(trigger_times)[sorted_idx],
+        np.array(trigger_peaks)[sorted_idx],
+        np.array(trigger_lengths)[sorted_idx]
+    )
+
+
+
+    
+
+
+
+def taup_slow_dist_depth(velocity_model, max_depth, max_dist, grid_size):
+
+    model = TauPyModel(model=velocity_model)
+
+    depth_min = 0 #kilometers
+    depth_max = max_depth #kilometers, 100
+    num_dep = grid_size
+    num_dist = num_dep
+    dist_min = 0 # kilometers
+    dist_max = max_dist #kilometers
+
+    depth_vec = np.linspace(depth_min,depth_max,num_dep)
+
+    dist_vec = np.linspace(dist_min,dist_max,num_dist)
+
+    distmat, depmat = np.meshgrid(dist_vec, depth_vec)
+
+    slowmat = np.zeros((num_dep, num_dist))
+
+    for i in range(num_dep):
+        distances = distmat[i]
+        depths = depmat[i]
+        for j in range(num_dep):
+            dist = kilometers2degrees(distances[j])
+            arrivals = model.get_travel_times(source_depth_in_km=depths[j],
+                                      distance_in_degree=dist) 
+                            
+            arr = arrivals[0]
+            angle = arr.incident_angle
+            vh = 4.8/(np.sin(np.deg2rad(angle))) #NEED TO CHANGE THIS VALUE
+            slow = 1/vh
+            slowmat[i,j] = slow
+
+    return depmat, distmat, slowmat
+    
+
+def rotate_channel(st, inv, channel): ###NEED TO FINISH-------------
+    for i in range(len(st)):
+        tr = st[i]
+        if channel[:-1] == 'Z':
+            if inv[0][i].channels[0].dip == 90:
+                tr.data = -1*tr.data
+        elif channel[:-1] == 'N':
+            if inv[0][i].channels[0].azimuth == 180:
+                tr.data = -1*tr.data
+        elif channel[:-1] == 'E':
+            if inv[0][i].channels[0].azimuth == 270:
+                tr.data = -1*tr.data
+
+def intersect_beams(lat1, lon1, baz1, lat2, lon2, baz2):
+    '''
+    Finds intersection of two aray beams and calculates lat/lon of the intersection
+    
+    Parameters:
+        lat1: latitude of first array
+        lon1: longitude of first array
+        baz1: backazimuth from first array
+        lat2: latitude of second array
+        lon2: longitude of second array
+        baz2: backazimuth from second array
+
+    Returns: 
+        lat: latitude of intersection
+        lon: longitude of intersection
+        
+        
+    '''
+    
+    geod = Geod(ellps="WGS84")
+    az1 = baz1
+    az2 = baz2
+    
+    def to_cart(lat, lon):
+        lat = np.deg2rad(lat)
+        lon = np.deg2rad(lon)
+        return np.array([
+            np.cos(lat)*np.cos(lon),
+            np.cos(lat)*np.sin(lon),
+            np.sin(lat)
+        ])
+    
+    # Station points
+    p1 = to_cart(lat1, lon1)
+    p2 = to_cart(lat2, lon2)
+    
+    # Second points slightly along azimuth
+    lon1b, lat1b, _ = geod.fwd(lon1, lat1, az1, 1000)
+    lon2b, lat2b, _ = geod.fwd(lon2, lat2, az2, 1000)
+    
+    p1b = to_cart(lat1b, lon1b)
+    p2b = to_cart(lat2b, lon2b)
+    
+    # Great circle normals
+    n1 = np.cross(p1, p1b)
+    n2 = np.cross(p2, p2b)
+    
+    # Intersection line
+    intersection = np.cross(n1, n2)
+    intersection /= np.linalg.norm(intersection)
+    
+    # Two antipodal solutions
+    i1 = intersection
+    i2 = -intersection
+    
+    def to_latlon(vec):
+        lat = np.rad2deg(np.arcsin(vec[2]))
+        lon = np.rad2deg(np.arctan2(vec[1], vec[0]))
+        return lat, lon
+    
+    return to_latlon(i1), to_latlon(i2)
+   
 
 
 
@@ -556,7 +1741,7 @@ def cos_model(Z_deg, a, b, phi_deg):
 #### FUNCTIONS FOR 3D SNELLS INVERSION ###########################
 ############################################################
 
-def combined_residuals(p, baz, takeoff, baz_obs, dp_obs, w_bazw, w_p):
+def combined_residuals(initial_guess, baz, takeoff, baz_error, slow_error, w_baz, w_p):
     
     """
     Args:
@@ -574,7 +1759,7 @@ def combined_residuals(p, baz, takeoff, baz_obs, dp_obs, w_bazw, w_p):
     Returns:
         angle_deg: angle in degrees of vector
     """
-    strike, dip, v_oceanic, v_continental = p
+    strike, dip, v_oceanic, v_continental = initial_guess
 
     N = len(baz)
 
@@ -590,7 +1775,7 @@ def combined_residuals(p, baz, takeoff, baz_obs, dp_obs, w_bazw, w_p):
         # --- BAZ residual (wrapped) ---
         baz_model = deflection_xy(incident, refracted)
         #baz_res[i] = np.angle(np.exp(1j * (baz_model - baz_obs[i]))) #for radians
-        baz_res[i] = np.deg2rad((baz_model - baz_obs[i] + 180) % 360 - 180) #for angles
+        baz_res[i] = np.deg2rad((baz_model - baz_error[i] + 180) % 360 - 180) #for angles
 
 
         # --- Slowness residual ---
@@ -599,7 +1784,30 @@ def combined_residuals(p, baz, takeoff, baz_obs, dp_obs, w_bazw, w_p):
         p_ref = horizontal_slowness(refracted_unrot, v_continental)
         p_model = p_inc - p_ref
 
-        p_res[i] = p_model - dp_obs[i]
+        p_res[i] = p_model - slow_error[i]
+        
+        return np.hstack([w_baz * baz_res, w_p * p_res])
 
-    # Stack residuals
-    return np.hstack([w_baz * baz_res, w_p * p_res])
+def slab_inversion(initial_guess, bounds, source_baz, takeoff, baz_error, slow_error, weight_baz, weight_slow):
+    #####INVERSION######################################
+
+    #Initial guess---------------------
+    x0 = initial_guess
+
+    #Value bounds---------------------
+    bounds = bounds
+
+    res = least_squares(
+        combined_residuals,
+        x0=x0,
+        bounds=bounds,
+        args=(source_baz, takeoff, baz_error, slow_error, weight_baz, weight_slow),
+        )
+
+    strike_fit, dip_fit, v_oceanic_fit, v_continental_fit = res.x
+
+    print('Best strike:', strike_fit)
+    print('Best dip:', dip_fit)
+    print('Best oceanic vel:', v_oceanic_fit)
+    print('Best continental vel:', v_continental_fit)
+    return strike_fit, dip_fit, v_oceanic_fit, v_continental_fit

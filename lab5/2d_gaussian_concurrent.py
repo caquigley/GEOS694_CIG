@@ -84,7 +84,7 @@ if __name__ == "__main__":
         ymin = int(sys.argv[3])
         ymax = int(sys.argv[4])
         N = xmax - xmin
-        #step = N // nproc
+       
         step = N / nproc
         
         
@@ -120,16 +120,3 @@ if __name__ == "__main__":
     #print(f"Elapsed Time: {elapsed}s")
         #plt.show()
 
-#Serial: 39.315 s
-#Concurrent 1: 42.93652415275574s
-#Concurrent 2: 22.389034032821655s
-#Concurrent 3: 14.734593152999878s
-#Concurrent 4: 11.91014289855957s
-#Concurrent 5: 9.557326078414917s
-#Concurrent 6: 7.992908000946045s
-#Concurrent 7: 7.233935117721558s
-#Concurrent 8: 6.227513790130615s
-#Concurrent 9: 6.199244022369385s
-#Concurrent 10: 5.911754131317139s
-
-#
